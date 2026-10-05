@@ -1,0 +1,78 @@
+# Wrenfield Ledger — Internal Engineering Documentation
+
+## Overview
+
+Wrenfield Ledger is an internal expense-tracking and budgeting platform built for small finance teams. The project started as a weekend prototype in March 2023 and has since grown into a service used by roughly 40 internal teams across the company. The core philosophy of the project is "boring technology, fast iteration" — we deliberately avoid trendy frameworks in favor of tools the whole team already understands.
+
+The system is composed of three services: the API server, the ledger-worker background processor, and the notifications service. All three are written in Go and communicate over gRPC internally, with a public-facing REST API exposed through an API gateway.
+
+## Architecture
+
+### Database
+
+Wrenfield Ledger uses PostgreSQL 15 as its primary datastore. We chose Postgres over alternatives like MySQL or MongoDB because the ledger data is inherently relational — transactions belong to accounts, accounts belong to budgets, and budgets belong to teams. Enforcing referential integrity at the database layer caught several bugs early in development that would have been painful to debug in application code.
+
+The database runs on a single primary instance with two read replicas. Connection pooling is handled by PgBouncer, configured in transaction mode with a pool size of 25 connections per service instance. The main tables are:
+
+- `accounts` — one row per financial account (checking, savings, credit card)
+- `transactions` — the core ledger entries, append-only by design
+- `budgets` — monthly budget allocations per category
+- `categories` — a fixed taxonomy of spending categories, currently 34 categories
+- `audit_log` — every mutation to `transactions` is mirrored here for compliance
+
+We migrated from a single Postgres 12 instance to the current Postgres 15 setup in October 2024. The migration took about six hours of planned downtime on a Saturday morning and was executed using `pg_upgrade` rather than a dump-and-restore, since the dataset had grown to around 80GB by that point.
+
+### Caching layer
+
+Redis 7 is used for two purposes: session storage and a short-lived cache for budget summary calculations, which are expensive to compute on every dashboard load. Budget summaries are cached for 5 minutes with a cache-aside pattern. Session tokens are stored with a 14-day TTL, refreshed on every authenticated request.
+
+We evaluated Memcached early on but chose Redis because we also wanted pub/sub for the notifications service, and running two separate systems for caching and messaging felt like unnecessary operational overhead for a team of our size.
+
+### Authentication
+
+Authentication is handled via JWT tokens, issued after a successful login against our internal SSO provider (built on top of Okta). Access tokens are short-lived, expiring after 15 minutes, and are paired with a refresh token stored in an HttpOnly cookie with a 14-day expiry, matching the Redis session TTL mentioned above.
+
+Authorization uses a role-based access control model with four roles: `viewer`, `contributor`, `budget_owner`, and `admin`. Role assignments are scoped per-team, so a person can be an `admin` on their own team's budget while only a `viewer` on another team's.
+
+## API design
+
+The public REST API is versioned via URL path, currently at `/api/v2/`. Version 1 was deprecated in January 2025 and is scheduled for full removal in Q3 2026. All endpoints return JSON, and all timestamps are in ISO 8601 format, UTC.
+
+Key endpoints:
+
+- `POST /api/v2/transactions` — create a new transaction. Requires `contributor` role or higher.
+- `GET /api/v2/budgets/{budget_id}/summary` — returns the cached budget summary described above.
+- `POST /api/v2/budgets/{budget_id}/lock` — locks a budget against further edits, requires `budget_owner` or `admin`.
+- `GET /api/v2/audit-log` — admin-only, paginated audit trail, defaults to 50 results per page, max 200.
+
+Rate limiting is applied per API key, at 100 requests per minute for standard keys and 500 requests per minute for keys marked as `internal-service`. Rate limit state is tracked in Redis using a sliding window algorithm.
+
+## Deployment
+
+Wrenfield Ledger runs on Kubernetes, currently on a cluster hosted on AWS EKS running Kubernetes 1.29. Each of the three services (API server, ledger-worker, notifications) runs as its own Deployment, with the API server configured to autoscale between 3 and 12 pods based on CPU utilization, targeting 60% average CPU.
+
+Deployments are automated through a GitHub Actions pipeline. Every merge to `main` triggers a build, a full test suite run (currently around 1,400 tests, taking about 9 minutes), and if tests pass, a canary deployment to 10% of production traffic for 15 minutes before a full rollout. This canary step has caught three significant bugs since it was introduced in June 2025, most notably a transaction rounding error that only manifested for accounts using the Japanese Yen currency setting.
+
+Secrets are managed through AWS Secrets Manager, synced into Kubernetes via the External Secrets Operator, refreshed every 10 minutes.
+
+## Monitoring and observability
+
+We use Prometheus for metrics collection and Grafana for dashboards. The most important dashboard is the "Ledger Health" board, which tracks transaction write latency (p50, p95, p99), the Redis cache hit rate for budget summaries (currently averaging around 87%), and the depth of the ledger-worker's processing queue.
+
+Distributed tracing is handled through OpenTelemetry, with traces exported to a self-hosted Jaeger instance. On-call engineers are expected to check trace waterfalls before escalating a latency incident, since roughly half of past incidents traced back to N+1 query patterns in the budget summary endpoint rather than infrastructure issues.
+
+Alerting is configured through Prometheus Alertmanager, routed to PagerDuty. The primary on-call rotation currently has six engineers, each doing a one-week shift, rotating every Monday at 10am.
+
+## Team and ownership
+
+The Wrenfield Ledger team currently consists of five engineers: two backend engineers focused on the API and worker services, one engineer dedicated to the notifications service, one platform engineer who owns the Kubernetes infrastructure and CI/CD pipeline, and one engineering manager. The team sits within the broader Finance Platform organization.
+
+Code review requires at least one approval from a team member with `write` access to the repository, and any change touching the `transactions` or `audit_log` tables requires a second approval from either the platform engineer or the engineering manager, given the compliance sensitivity of that data.
+
+## Known limitations and future work
+
+Currently, the system does not support multi-currency budgets within a single team — a budget is denominated in one currency, set at creation time and immutable afterward. This has been requested by three international teams and is tentatively planned for Q4 2026, pending a broader redesign of the `budgets` table schema.
+
+The notifications service currently only supports email and Slack as delivery channels. A request to add SMS notifications for budget-lock events has been open since August 2025 but is not yet prioritized, mainly due to the added compliance burden of handling phone numbers.
+
+Load testing has shown the current architecture comfortably handles up to around 500 transactions per second sustained, with p99 write latency staying under 200ms. Beyond that threshold, write latency degrades sharply, primarily due to lock contention on the `budgets` table when many transactions hit the same budget simultaneously. A sharding strategy for high-volume budgets is under discussion but has not been scoped yet.
